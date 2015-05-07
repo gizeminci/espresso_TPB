@@ -1,0 +1,610 @@
+/*
+  Copyright (C) 2010,2011,2012,2013,2014 The ESPResSo project
+  Copyright (C) 2002,2003,2004,2005,2006,2007,2008,2009,2010 
+    Max-Planck-Institute for Polymer Research, Theory Group
+  
+  This file is part of ESPResSo.
+  
+  ESPResSo is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+  
+  ESPResSo is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+  
+  You should have received a copy of the GNU General Public License
+  along with this program.  If not, see <http://www.gnu.org/licenses/>. 
+*/
+#ifndef _THERMOSTAT_H
+#define _THERMOSTAT_H
+/** \file thermostat.hpp 
+
+*/
+
+#include <cmath>
+#include "utils.hpp"
+#include "particle_data.hpp"
+#include "random.hpp"
+#include "global.hpp"
+#include "integrate.hpp"
+#include "cells.hpp"
+#include "lb.hpp"
+#include "dpd.hpp"
+#include "virtual_sites.hpp"
+
+/** \name Thermostat switches*/
+/************************************************************/
+/*@{*/
+
+#define THERMO_OFF        0
+#define THERMO_LANGEVIN   1
+#define THERMO_DPD        2
+#define THERMO_NPT_ISO    4
+#define THERMO_LB         8
+#define THERMO_INTER_DPD  16
+#define THERMO_GHMC       32
+
+/*@}*/
+
+#if (!defined(FLATNOISE) && !defined(GAUSSRANDOMCUT) && !defined(GAUSSRANDOM))
+#define FLATNOISE
+#endif
+
+/************************************************
+ * exported variables
+ ************************************************/
+
+/** Switch determining which thermostat to use. This is a or'd value
+    of the different possible thermostats (defines: \ref THERMO_OFF,
+    \ref THERMO_LANGEVIN, \ref THERMO_DPD \ref THERMO_NPT_ISO). If it
+    is zero all thermostats are switched off and the temperature is
+    set to zero.  */
+extern int thermo_switch;
+
+/** temperature. */
+extern double temperature;
+
+/** Langevin friction coefficient gamma. */
+extern double langevin_gamma;
+
+/** Friction coefficient for nptiso-thermostat's inline-function friction_therm0_nptiso */
+extern double nptiso_gamma0;
+/** Friction coefficient for nptiso-thermostat's inline-function friction_thermV_nptiso */
+extern double nptiso_gammav;
+
+/** Number of NVE-MD steps in GHMC Cycle*/
+extern int ghmc_nmd;
+/** Phi parameter for GHMC partial momenum update step */
+extern double ghmc_phi;
+
+/************************************************
+ * functions
+ ************************************************/
+
+
+/** initialize constants of the thermostat on
+    start of integration */
+void thermo_init();
+
+/** very nasty: if we recalculate force when leaving/reentering the integrator,
+    a(t) and a((t-dt)+dt) are NOT equal in the vv algorithm. The random
+    numbers are drawn twice, resulting in a different variance of the random force.
+    This is corrected by additional heat when restarting the integrator here.
+    Currently only works for the Langevin thermostat, although probably also others
+    are affected.
+*/
+void thermo_heat_up();
+
+/** pendant to \ref thermo_heat_up */
+void thermo_cool_down();
+
+#ifdef LEES_EDWARDS
+/** locally defined funcion to find Vx relative to the LE shear frame
+    @param i      coordinate index
+    @param vel    velocity vector
+    @param pos    position vector
+    @return       adjusted (or not) i^th velocity coordinate */
+inline double le_frameV(int i, double *vel, double *pos) {
+
+   double relY;
+
+   if( i == 0 ){
+       relY  = pos[1] * box_l_i[1] - 0.5;
+       return( vel[0] - relY * lees_edwards_rate );
+   }
+   else
+       return vel[i];
+}
+#endif
+
+#ifdef NPT
+/** add velocity-dependend noise and friction for NpT-sims to the particle's velocity 
+    @param dt_vj  j-component of the velocity scaled by time_step dt 
+    @return       j-component of the noise added to the velocity, also scaled by dt (contained in prefactors) */
+inline double friction_therm0_nptiso(double dt_vj) {
+  extern double nptiso_pref1, nptiso_pref2;
+  if(thermo_switch & THERMO_NPT_ISO)   
+#if defined (FLATNOISE)
+    return ( nptiso_pref1*dt_vj + nptiso_pref2*(d_random()-0.5) );
+#elif defined (GAUSSRANDOMCUT)
+    return ( nptiso_pref1*dt_vj + nptiso_pref2*gaussian_random_cut() );
+#elif defined (GAUSSRANDOM)
+    return ( nptiso_pref1*dt_vj + nptiso_pref2*gaussian_random() );
+#else
+#error No Noise defined
+#endif
+  return 0.0;
+}
+
+/** add p_diff-dependend noise and friction for NpT-sims to \ref nptiso_struct::p_diff */
+inline double friction_thermV_nptiso(double p_diff) {
+  extern double nptiso_pref3, nptiso_pref4;
+  if(thermo_switch & THERMO_NPT_ISO)   
+#if defined (FLATNOISE)
+    return ( nptiso_pref3*p_diff + nptiso_pref4*(d_random()-0.5) );
+#elif defined (GAUSSRANDOMCUT)
+    return ( nptiso_pref3*p_diff + nptiso_pref4*gaussian_random_cut() );
+#elif defined (GAUSSRANDOM)
+    return ( nptiso_pref3*p_diff + nptiso_pref4*gaussian_random() );
+#else
+#error No Noise defined
+#endif
+  return 0.0;
+}
+#endif
+
+// CIRCULAR FLOW FIELD
+
+/** calculates the fluid velocity for each particle */
+inline void fluid_velocity(Particle *p, double vfxyz[3]){
+    
+    // 3 vorticity level
+    int n=3;
+    
+    // all parameters are defined as an array
+    
+    double nx[n], ny[n], nz[n];                 // eddies in x-, y- and z-directions
+    double l[n];                                // eddie size (radius)
+    double cx[n], cy[n], cz[n];                 // centers of the subdomains
+    double cxx[n], cyy[n], czz[n];              // corners of the subdomains
+    double rxy[n], rxz[n], ryz[n];              // radius to determine inner or corner flow
+    double coefxy[n], coefxz[n], coefyz[n];     // sign of the inner velocity field
+    double coefx[n], coefy[n], coefz[n];        // sign of the corner velocity field
+    double C1xy[n], C1xz[n], C1yz[n];           // inner flow parameters
+    double C2xy[n], C2xz[n], C2yz[n];           // corner flow parameters
+    double vx1[n], vx2[n], vy1[n], vy2[n], vz1[n], vz2[n];                 // velocities of the eddies
+    double teta_xy[n], teta_xz[n], teta_yz[n];  // angle to define C2
+    double constant_vel;			// linear velocity directed from upper corner on xy plane to lower corner on xz plane
+    
+    int iqdr[n], jqdr[n], kqdr[n];              // quadrant in the vortex
+    int a;                                      // loop parameter
+
+    double weightxy, weightxz, weightyz;	// Third method to calculate C2 (cf. Kronenburg's report)
+    double xdist, ydist, zdist, sqrtX_xy, sqrtX_xz, sqrtY_xy, sqrtY_yz, sqrtZ_xz, sqrtZ_yz;
+
+    vfxyz[0]=0; vfxyz[1]=0; vfxyz[2]=0;
+
+    weightxy=0; weightxz=0; weightyz=0;
+    xdist=0; ydist=0; zdist=0; sqrtX_xy=0; sqrtX_xz=0; sqrtY_xy=0; sqrtY_yz=0; sqrtZ_xz=0; sqrtZ_yz=0;
+    
+    // initialize the parameters
+    
+    for (a=0; a<n; a++) {
+        l[a] = 0;
+        cx[a] = 0;
+        cy[a] = 0;
+        cz[a] = 0;
+        cxx[a] = 0;
+        cyy[a] = 0;
+        czz[a] = 0;
+        iqdr[a] = 0;
+        jqdr[a] = 0;
+        kqdr[a] = 0;
+    }
+    
+    // Eddies and their strength
+    
+    nx[0] = 8;                                   // Smallest eddie in x-direction
+    ny[0] = 8;                                   // Smallest eddie in y-direction
+    nz[0] = 8;                                   // Smallest eddie in z-direction
+    
+    C1xy[0] = 0.00657;                             // Kn-2-Pe-0.1
+    C1xz[0] = 0.00657;
+    C1yz[0] = 0.00657;
+ 
+ 
+    constant_vel= C1xy[0]*(box_l[0]/(2*nx[0]))*0.1;
+    
+    for (a=1; a<n; a++) {
+        C1xy[a] = C1xy[a-1]*0.89;
+        C1xz[a] = C1xz[a-1]*0.89;
+        C1yz[a] = C1yz[a-1]*0.89;
+        
+        nx[a] = nx[0]/(pow(2,a));
+        ny[a] = ny[0]/(pow(2,a));
+        nz[a] = nz[0]/(pow(2,a));
+    }
+    
+    
+    for (a=0; a<n; a++) {
+        
+        // Size of the eddies (radius)
+        l[a] = box_l[0]/(2*nx[a]);
+        
+        // Find the quadrat in the vortex
+        iqdr[a] = int(p->r.p[0]/(box_l[0]/(2*nx[a])));
+        jqdr[a] = int(p->r.p[1]/(box_l[1]/(2*ny[a])));
+        kqdr[a] = int(p->r.p[2]/(box_l[2]/(2*nz[a])));
+        
+        // Find the center of the vortex
+        cx[a] = int(iqdr[a]/2.)*(2*l[a])+l[a];
+        cy[a] = int(jqdr[a]/2.)*(2*l[a])+l[a];
+        cz[a] = int(kqdr[a]/2.)*(2*l[a])+l[a];
+        
+        // Position of the corner
+        cxx[a] = (int((iqdr[a]+1)/2)*2*l[a]);
+        cyy[a] = (int((jqdr[a]+1)/2)*2*l[a]);
+        czz[a] = (int((kqdr[a]+1)/2)*2*l[a]);
+        
+        // Inside or outside the vortex
+        rxy[a] = sqrt(SQR(p->r.p[0]-cx[a])+SQR(p->r.p[1]-cy[a]));
+        rxz[a] = sqrt(SQR(p->r.p[0]-cx[a])+SQR(p->r.p[2]-cz[a]));
+        ryz[a] = sqrt(SQR(p->r.p[1]-cy[a])+SQR(p->r.p[2]-cz[a]));
+        
+        // Sign coefficients
+        coefxy[a] = pow((-1),(int(iqdr[a]/2.)+int(jqdr[a]/2.)));
+        coefxz[a] = pow((-1),(int(iqdr[a]/2.)+int(kqdr[a]/2.)));
+        coefyz[a] = pow((-1),(int(jqdr[a]/2.)+int(kqdr[a]/2.)));
+        
+        coefx[a] = (p->r.p[0]-0.00000000001-cx[a])/fabs((p->r.p[0]-0.00000000001-cx[a]));
+        coefy[a] = (p->r.p[1]-0.00000000001-cy[a])/fabs((p->r.p[1]-0.00000000001-cy[a]));
+        coefz[a] = (p->r.p[2]-0.00000000001-cz[a])/fabs((p->r.p[2]-0.00000000001-cz[a]));
+        
+        // Corner flow vortex strength related to the inner flow vortex strength
+
+        // Second method
+        //teta_xy[a] = atan(fabs((cy[a]-0.000000000001-p->r.p[1])/(cx[a]-0.000000000001-p->r.p[0])));
+        //teta_xz[a] = atan(fabs((cz[a]-0.000000000001-p->r.p[2])/(cx[a]-0.000000000001-p->r.p[0])));
+        //teta_yz[a] = atan(fabs((cz[a]-0.000000000001-p->r.p[2])/(cy[a]-0.000000000001-p->r.p[1])));
+        //C2xy[a] = 0.5*C1xy[a]/(sin(teta_xy[a])+cos(teta_xy[a])-sin(2*teta_xy[a]));
+        //C2xz[a] = 0.5*C1xz[a]/(sin(teta_xz[a])+cos(teta_xz[a])-sin(2*teta_xz[a]));
+        //C2yz[a] = 0.5*C1yz[a]/(sin(teta_yz[a])+cos(teta_yz[a])-sin(2*teta_yz[a]));
+
+ 
+        // 3rd method w a weight function
+
+        if (fabs(p->r.p[1]-cy[a])>fabs(p->r.p[0]-cx[a])) {
+           weightxy = 1.-(sqrt((pow((p->r.p[0]-cx[a]),2)+pow((p->r.p[1]-cy[a]),2)-rxy[a]))/(sqrt(rxy[a]*rxy[a]+pow((p->r.p[0]-cx[a]),2))-rxy[a]));
+        }else {
+           weightxy = 1.-(sqrt((pow((p->r.p[0]-cx[a]),2)+pow((p->r.p[1]-cy[a]),2)-rxy[a]))/(sqrt(rxy[a]*rxy[a]+pow((p->r.p[1]-cy[a]),2))-rxy[a]));
+        }
+
+        if (fabs(p->r.p[2]-cz[a])>fabs(p->r.p[0]-cx[a])) {
+           weightxz = 1.-(sqrt((pow((p->r.p[0]-cx[a]),2)+pow((p->r.p[2]-cz[a]),2)-rxz[a]))/(sqrt(rxz[a]*rxz[a]+pow((p->r.p[0]-cx[a]),2))-rxz[a]));
+        }else {
+           weightxz = 1.-(sqrt((pow((p->r.p[0]-cx[a]),2)+pow((p->r.p[2]-cz[a]),2)-rxz[a]))/(sqrt(rxz[a]*rxz[a]+pow((p->r.p[2]-cz[a]),2))-rxz[a]));
+        }
+
+        if (fabs(p->r.p[2]-cz[a])>fabs(p->r.p[1]-cy[a])) {
+           weightyz = 1.-(sqrt((pow((p->r.p[1]-cy[a]),2)+pow((p->r.p[2]-cz[a]),2)-ryz[a]))/(sqrt(ryz[a]*ryz[a]+pow((p->r.p[1]-cy[a]),2))-ryz[a]));
+        }else {
+           weightyz = 1.-(sqrt((pow((p->r.p[1]-cy[a]),2)+pow((p->r.p[2]-cz[a]),2)-ryz[a]))/(sqrt(ryz[a]*ryz[a]+pow((p->r.p[2]-cz[a]),2))-ryz[a]));
+        }
+
+        weightxy=dmax(weightxy-0.005,0);
+        weightxz=dmax(weightxz-0.005,0);
+        weightyz=dmax(weightyz-0.005,0);
+
+        xdist = fabs(p->r.p[0]-cx[a]);
+        ydist = fabs(p->r.p[1]-cy[a]);
+        zdist = fabs(p->r.p[2]-cz[a]);
+
+        sqrtX_xy = sqrt(rxy[a]*rxy[a]-xdist*xdist);
+        sqrtX_xz = sqrt(rxz[a]*rxz[a]-xdist*xdist);
+
+        sqrtY_xy = sqrt(rxy[a]*rxy[a]-ydist*ydist);
+        sqrtY_yz = sqrt(ryz[a]*ryz[a]-ydist*ydist);
+
+        sqrtZ_xz = sqrt(rxz[a]*rxz[a]-zdist*zdist);
+        sqrtZ_yz = sqrt(ryz[a]*ryz[a]-zdist*zdist);
+
+        // inside or outside the radius in xy plane
+        if (rxy[a]<=l[a]) {
+            vx1[a] = C1xy[a]*(p->r.p[1]-cy[a])*coefxy[a];
+            vy1[a] = (-C1xy[a])*(p->r.p[0]-cx[a])*coefxy[a];
+        }else {
+            vx1[a] = coefxy[a]*coefy[a]*C1xy[a]*((rxy[a]-xdist)*(weightxy*((rxy[a]+sqrtY_xy)/ydist)-(1-weightxy))+weightxy*((2*rxy[a]/log(xdist)+sqrtX_xy-rxy[a]*log(rxy[a]+sqrtX_xy))-(ydist+rxy[a]*log(rxy[a]-ydist))));
+            vy1[a] = coefxy[a]*coefx[a]*(-C1xy[a])*((rxy[a]-ydist)*(weightxy*((rxy[a]+sqrtX_xy)/xdist)-(1-weightxy))+weightxy*((2*rxy[a]/log(ydist)+sqrtY_xy-rxy[a]*log(rxy[a]+sqrtY_xy))-(xdist+rxy[a]*log(rxy[a]-xdist))));
+        }
+        
+        // inside or outside the radius in xz plane
+        
+        if (rxz[a]<=l[a]) {
+            vx2[a] = C1xz[a]*(p->r.p[2]-cz[a])*coefxz[a];
+            vz1[a] = (-C1xz[a])*(p->r.p[0]-cx[a])*coefxz[a];
+        }else {
+            vx2[a] = coefxz[a]*coefz[a]*C1xz[a]*((rxz[a]-xdist)*(weightxz*((rxz[a]+sqrtZ_xz)/zdist)-(1-weightxz))+weightxz*((2*rxz[a]/log(xdist)+sqrtX_xz-rxz[a]*log(rxz[a]+sqrtX_xz))-(zdist+rxz[a]*log(rxz[a]-zdist))));
+            vz1[a] = coefxz[a]*coefx[a]*(-C1xz[a])*((rxz[a]-zdist)*(weightxz*((rxz[a]+sqrtX_xz)/xdist)-(1-weightxz))+weightxz*((2*rxz[a]/log(zdist)+sqrtZ_xz-rxz[a]*log(rxz[a]+sqrtZ_xz))-(xdist+rxz[a]*log(rxz[a]-xdist))));
+
+        }
+        
+        // inside or outside the radius in yz plane
+        
+        if (ryz[a]<l[a]) {
+            vy2[a] = C1yz[a]*(p->r.p[2]-cz[a])*coefyz[a];
+            vz2[a] = (-C1yz[a])*(p->r.p[1]-cy[a])*coefyz[a];
+        }else {
+            vy2[a] = coefyz[a]*coefz[a]*C1yz[a]*((ryz[a]-ydist)*(weightyz*((ryz[a]+sqrtZ_yz)/zdist)-(1-weightyz))+weightyz*((2*ryz[a]/log(ydist)+sqrtY_yz-ryz[a]*log(ryz[a]+sqrtY_yz))-(zdist+ryz[a]*log(ryz[a]-zdist))));
+            vz2[a] = coefyz[a]*coefy[a]*(-C1yz[a])*((ryz[a]-zdist)*(weightyz*((ryz[a]+sqrtY_yz)/ydist)-(1-weightyz))+weightyz*((2*ryz[a]/log(zdist)+sqrtZ_yz-ryz[a]*log(ryz[a]+sqrtZ_yz))-(ydist+ryz[a]*log(ryz[a]-ydist))));
+
+        }
+        
+        // fluid velocity
+
+       vfxyz[0] += vx1[a]+vx2[a]+constant_vel;
+       vfxyz[1] += vy1[a]+vy2[a]-constant_vel;
+       vfxyz[2] += vz1[a]+vz2[a]+constant_vel;
+
+    }
+    
+    
+    //printf("particle:%d position: %e, %e, %e box:%e l:%e & iqdr=%d jqdr=%d cx=%e cy=%e cxx=%e cyy=%e \n",p->p.identity, p->r.p[0], p->r.p[1], p->r.p[2], box_l[0], l, iqdr, jqdr, cx, cy, cxx, cyy);
+    
+    
+    
+    //printf("p:%d: %e, %e, %e signxx1=%e signyy1=%e iqdr1=%d jqdr1=%d Coef=%e C1=%e C2=%e vx1=%e vy1=%e\n",p->p.identity, p->r.p[0], p->r.p[1], p->r.p[2], signxx1, signyy1, iqdr1, jqdr1, coef, C1_1, C1_2, vx1_1, vy1_1);
+    
+    //printf("%e %e \n", part->p.identity, sim_time);
+}
+
+/** overwrite the forces of a particle with
+    the friction term, i.e. \f$ F_i= -\gamma v_i + \xi_i\f$.
+*/
+inline void friction_thermo_langevin(Particle *p)
+{
+  extern double langevin_pref1, langevin_pref2, langevin_pref3;
+#ifdef LANGEVIN_PER_PARTICLE
+  double langevin_pref1_temp, langevin_pref2_temp;
+#endif
+  
+  int j;
+#ifdef MASS
+  double massf = sqrt(PMASS(*p));
+#else
+  double massf = 1;
+#endif
+
+  double vfxyz[3];
+
+#ifdef VIRTUAL_SITES
+ #ifndef VIRTUAL_SITES_THERMOSTAT
+    if (ifParticleIsVirtual(p))
+    {
+     for (j=0;j<3;j++)
+      p->f.f[j]=0;
+    return;
+   }
+ #endif
+
+ #ifdef THERMOSTAT_IGNORE_NON_VIRTUAL
+    if (!ifParticleIsVirtual(p))
+    {
+     for (j=0;j<3;j++)
+      p->f.f[j]=0;
+    return;
+   }
+ #endif
+#endif	  
+
+  for ( j = 0 ; j < 3 ; j++) {
+#ifdef EXTERNAL_FORCES
+    if (!(p->l.ext_flag & COORD_FIXED(j)))
+#endif
+    {
+#ifdef LANGEVIN_PER_PARTICLE  
+      
+#if defined (FLATNOISE)
+      if(p->p.gamma >= 0.) {
+        langevin_pref1_temp = -p->p.gamma/time_step;
+        
+        if(p->p.T >= 0.)
+          langevin_pref2_temp = sqrt(24.0*p->p.T*p->p.gamma/time_step);
+        else
+          langevin_pref2_temp = sqrt(24.0*temperature*p->p.gamma/time_step);
+#ifdef LEES_EDWARDS
+        p->f.f[j] = langevin_pref1_temp*
+                       le_frameV(j, p->m.v, p->r.p)*PMASS(*p) + langevin_pref2_temp*(d_random()-0.5)*massf;
+#else
+        p->f.f[j] = langevin_pref1_temp*p->m.v[j]*PMASS(*p) + langevin_pref2_temp*(d_random()-0.5)*massf;
+#endif
+
+      }
+      else {
+        if(p->p.T >= 0.)
+          langevin_pref2_temp = sqrt(24.0*p->p.T*langevin_gamma/time_step);
+        else          
+          langevin_pref2_temp = langevin_pref2;
+        
+#ifdef LEES_EDWARDS
+        p->f.f[j] = langevin_pref1*
+                  le_frameV(j, p->m.v, p->r.p)*PMASS(*p) + langevin_pref2_temp*(d_random()-0.5)*massf;
+#else
+        p->f.f[j] = langevin_pref1*p->m.v[j]*PMASS(*p) + langevin_pref2_temp*(d_random()-0.5)*massf;
+#endif
+
+      }
+#elif defined (GAUSSRANDOMCUT)
+      if(p->p.gamma >= 0.) {
+        langevin_pref1_temp = -p->p.gamma/time_step;
+        
+        if(p->p.T >= 0.)
+          langevin_pref2_temp = sqrt(2.0*p->p.T*p->p.gamma/time_step);
+        else
+          langevin_pref2_temp = sqrt(2.0*temperature*p->p.gamma/time_step);
+        
+#ifdef LEES_EDWARDS
+        p->f.f[j] = langevin_pref1_temp*
+                       le_frameV(j, p->m.v, p->r.p)*PMASS(*p) + langevin_pref2_temp*gaussian_random_cut()*massf;
+#else
+        p->f.f[j] = langevin_pref1_temp*p->m.v[j]*PMASS(*p) + langevin_pref2_temp*gaussian_random_cut()*massf;
+#endif
+      }
+      else {
+        if(p->p.T >= 0.)
+          langevin_pref2_temp = sqrt(2.0*p->p.T*langevin_gamma/time_step);
+        else          
+          langevin_pref2_temp = langevin_pref2;
+        
+#ifdef LEES_EDWARDS
+        p->f.f[j] = langevin_pref1*
+                  le_frameV(j, p->m.v, p->r.p)*PMASS(*p) + langevin_pref2_temp*gaussian_random_cut()*massf;
+#else
+        p->f.f[j] = langevin_pref1*p->m.v[j]*PMASS(*p) + langevin_pref2_temp*gaussian_random_cut()*massf;
+#endif
+      }
+#elif defined (GAUSSRANDOM)
+      if(p->p.gamma >= 0.) {
+        langevin_pref1_temp = -p->p.gamma/time_step;
+        
+        if(p->p.T >= 0.)
+          langevin_pref2_temp = sqrt(2.0*p->p.T*p->p.gamma/time_step);
+        else
+          langevin_pref2_temp = sqrt(2.0*temperature*p->p.gamma/time_step);
+        
+#ifdef LEES_EDWARDS
+        p->f.f[j] = langevin_pref1_temp*
+                       le_frameV(j, p->m.v, p->r.p)*PMASS(*p) + langevin_pref2_temp*gaussian_random()*massf;
+#else
+        p->f.f[j] = langevin_pref1_temp*p->m.v[j]*PMASS(*p) + langevin_pref2_temp*gaussian_random()*massf;
+#endif
+      }
+      else {
+        if(p->p.T >= 0.)
+          langevin_pref2_temp = sqrt(2.0*p->p.T*langevin_gamma/time_step);
+        else          
+          langevin_pref2_temp = langevin_pref2;
+        
+#ifdef LEES_EDWARDS
+        p->f.f[j] = langevin_pref1*
+                  le_frameV(j, p->m.v, p->r.p)*PMASS(*p) + langevin_pref2_temp*gaussian_random()*massf;
+#else
+        p->f.f[j] = langevin_pref1*p->m.v[j]*PMASS(*p) + langevin_pref2_temp*gaussian_random()*massf;
+#endif
+      }
+#else
+#error No Noise defined
+#endif
+
+
+#else 
+
+#ifdef LEES_EDWARDS
+/*******************different shapes of noise */
+#if defined (FLATNOISE)
+      p->f.f[j] = langevin_pref1*le_frameV(j, p->m.v, p->r.p)
+                  * PMASS(*p) + langevin_pref2*(d_random()-0.5)*massf;
+#elif defined (GAUSSRANDOMCUT)
+      p->f.f[j] = langevin_pref1*le_frameV(j, p->m.v, p->r.p)
+                  * PMASS(*p) + langevin_pref2*gaussian_random_cut()*massf;
+#elif defined (GAUSSRANDOM)
+      p->f.f[j] = langevin_pref1*le_frameV(j, p->m.v, p->r.p)
+                  * PMASS(*p) + langevin_pref2*gaussian_random()*massf;
+#else
+#error No Noise defined
+#endif
+/*******************end different shapes of noise */
+
+#else //ndef LEES_EDWARDS
+/*******************different shapes of noise */
+#if defined (FLATNOISE)
+      fluid_velocity(p, vfxyz);
+      p->f.f[j] = langevin_pref1*(p->m.v[0]-(langevin_pref3*vfxyz[j]))*PMASS(*p) + langevin_pref2*(d_random()-0.5)*massf;
+#elif defined (GAUSSRANDOMCUT)
+      p->f.f[j] = langevin_pref1*p->m.v[j]*PMASS(*p) + langevin_pref2*gaussian_random_cut()*massf;
+#elif defined (GAUSSRANDOM)
+      p->f.f[j] = langevin_pref1*p->m.v[j]*PMASS(*p) + langevin_pref2*gaussian_random()*massf;
+#else
+#error No Noise defined
+#endif
+/*******************end different shapes of noise */
+#endif //end ifdef LEES_EDWARDS
+
+#endif
+    }
+#ifdef EXTERNAL_FORCES
+    else p->f.f[j] = 0;
+#endif
+  }
+  printf("%e %e %e\n",p->m.v[0],p->m.v[1],p->m.v[2]);
+  
+
+  ONEPART_TRACE(if(p->p.identity==check_id) fprintf(stderr,"%d: OPT: LANG f = (%.3e,%.3e,%.3e)\n",this_node,p->f.f[0],p->f.f[1],p->f.f[2]));
+  THERMO_TRACE(fprintf(stderr,"%d: Thermo: P %d: force=(%.3e,%.3e,%.3e)\n",this_node,p->p.identity,p->f.f[0],p->f.f[1],p->f.f[2]));
+}
+
+#ifdef ROTATION
+/** set the particle torques to the friction term, i.e. \f$\tau_i=-\gamma w_i + \xi_i\f$.
+    The same friction coefficient \f$\gamma\f$ is used as that for translation.
+*/
+inline void friction_thermo_langevin_rotation(Particle *p)
+{
+  extern double langevin_pref2;
+
+  int j;
+#ifdef VIRTUAL_SITES
+ #ifndef VIRTUAL_SITES_THERMOSTAT
+    if (ifParticleIsVirtual(p))
+    {
+     for (j=0;j<3;j++)
+      p->f.torque[j]=0;
+    return;
+   }
+ #endif
+
+ #ifdef THERMOSTAT_IGNORE_NON_VIRTUAL
+    if (!ifParticleIsVirtual(p))
+    {
+     for (j=0;j<3;j++)
+      p->f.torque[j]=0;
+    return;
+   }
+ #endif
+#endif	  
+      for ( j = 0 ; j < 3 ; j++) 
+      {
+#if defined (FLATNOISE)
+        #ifdef ROTATIONAL_INERTIA
+        p->f.torque[j] = -langevin_gamma*p->m.omega[j] *p->p.rinertia[j] + langevin_pref2*sqrt(p->p.rinertia[j]) * (d_random()-0.5);
+        #else
+        p->f.torque[j] = -langevin_gamma*p->m.omega[j] + langevin_pref2*(d_random()-0.5);
+        #endif
+#elif defined (GAUSSRANDOMCUT)
+        #ifdef ROTATIONAL_INERTIA
+        p->f.torque[j] = -langevin_gamma*p->m.omega[j] *p->p.rinertia[j] + langevin_pref2*sqrt(p->p.rinertia[j]) * gaussian_random_cut();
+        #else
+        p->f.torque[j] = -langevin_gamma*p->m.omega[j] + langevin_pref2*gaussian_random_cut();
+        #endif
+#elif defined (GAUSSRANDOM)
+        #ifdef ROTATIONAL_INERTIA
+        p->f.torque[j] = -langevin_gamma*p->m.omega[j] *p->p.rinertia[j] + langevin_pref2*sqrt(p->p.rinertia[j]) * gaussian_random();
+        #else
+        p->f.torque[j] = -langevin_gamma*p->m.omega[j] + langevin_pref2*gaussian_random();
+        #endif
+#else
+#error No Noise defined
+#endif
+      }
+      ONEPART_TRACE(if(p->p.identity==check_id) fprintf(stderr,"%d: OPT: LANG f = (%.3e,%.3e,%.3e)\n",this_node,p->f.f[0],p->f.f[1],p->f.f[2]));
+      THERMO_TRACE(fprintf(stderr,"%d: Thermo: P %d: force=(%.3e,%.3e,%.3e)\n",this_node,p->p.identity,p->f.f[0],p->f.f[1],p->f.f[2]));
+}
+#endif
+
+
+#endif
+
+
+
+
