@@ -1,0 +1,8 @@
+#!/bin/bash
+#PBS -N case-8_DNS
+#PBS -l walltime=00:30:00
+#PBS -l nodes=4:ppn=24
+#PBS -j oe
+cd $PBS_O_WORKDIR
+echo $PBS_O_WORKDIR
+aprun -n 96 ~/espresso_dns-propercollision/Espresso Test_Circular.tcl > circular6.txt 2>&1

@@ -1,0 +1,96 @@
+ESPResSo is maintained and developed mainly at the Institute for
+Computational Physics at Stuttgart University, Germany, in the group
+of Prof. Dr. Christian Holm (http://www.icp.uni-stuttgart.de).
+
+Until 2010, ESPResSo was maintained and developed mainly at the
+Max-Planck-Institute for Polymer Research in Mainz, Germany in the
+group of Prof. Dr. Kurt Kremer.
+
+The following people have contributed to ESPResSo:
+
+Core developers
+---------------
+Axel Arnold
+Olaf Lenz (maintainer)
+Florian Weik
+Stefan Kesselheim
+
+Bernward Mann (deceased 2006)
+Christoph Junghans (inactive)
+Hans-Jörg Limbach (inactive)
+Torsten Stühn (inactive)
+
+Contributors
+------------
+Adolfo Poma
+Alexander Schlaich
+Arjit Maitra
+Ben Reynwar (formerly: Reynolds)
+Christoph Schneider
+David Schwörer
+Dmitro Galperin
+Dmytro Antypov
+Dominic Röhm
+Elena Minina
+Florian Fahrenberger (formerly: Rühle)
+Florian Häußermann
+Francesca Lugli
+Frank Mühlbach
+Georg Rempfer
+Gizem Inci
+Gregoria Illya
+Hamid Zaheri
+Henri Menke
+Igor Pasichnyk
+Ira Cooke
+Ivan Cimrak
+Iveta Jancigova
+Joan Josep Cerdà
+Jon Halverson
+Joost de Graaf
+Josh Berryman
+Kai Grass
+Kai Kratzer
+Kai Szuttor
+Karen Johnston
+Konrad Breitsprecher
+Lukas Fischer
+Marcello Sega
+Markus Gusenbauer
+Matej Praprotnik
+Mehmet Sayar
+Mehmet Süzen
+Michael Kuron
+Mingyang Hu
+Muhammad Anwar
+Nils Binz
+Owen A. Hickey-Moriarty
+Patrick Diggins
+Pedro Ojeda
+Pedro Sanchez
+Peter Kosovan
+Pierre de Buyl
+Rudolf Weeber
+Sandeep Tyagi
+Sathish K. Sukumaran
+Sela Samin
+Shervin Raafatnia
+Simon Poblete
+Stephan Gekle
+Stefan Medina
+Thomas Spura
+Timo Schürg
+Tobias Richter
+Tobias Steinle
+Tristan Bereau
+Ulf Schiller
+Vagelis Harmandaris
+Vincent Ballenegger
+Vladimir Lobaskin
+Zunjing Wang
+
+Special thanks
+--------------
+Special thanks to Henrik Skov Midtiby for providing a GPL version of
+todonotes.sty.
+
